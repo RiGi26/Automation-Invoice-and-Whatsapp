@@ -1,0 +1,704 @@
+// === KONFIGURASI UTAMA ===
+const CONFIG = {
+  FOLDER_ID: 'YOUR_ID_FOLDER_DRIVE', 
+  LOGO_ID: 'YOU_FILE_LOGO_DRIVE', 
+
+  // === SETTING WHATSAPP (FONNTE) ===
+  WA_TOKEN: 'YOUR_TOKEN_FONTTE_API', 
+
+  BANK_NAME: 'xxxx',
+  ACCOUNT_NUMBER: 'xxxx',
+  ACCOUNT_NAME: 'xxx',
+  
+  // Mapping Kolom (A=0, B=1, C=2, D=3, E=4 ...)
+  COL_NAMA: 2,         // Kolom C
+  COL_WA: 4,           // Kolom E (Nomor WA)
+  COL_KOTA: 8,         // Kolom I
+  COL_KELAS: 11,       // Kolom L (Pilihan Kelas)
+  COL_PEMBAYARAN: 16,  // Kolom Q
+  COL_DISKON: 17,      // Kolom R
+  
+  // UPDATE: DIPISAH JADI 2 KOLOM
+  COL_LINK_PDF: 22,    // Kolom W (Untuk Link Drive)
+  COL_STATUS_WA: 23,   // Kolom X (Untuk Status Terkirim/Gagal)
+
+  // SETTING NOMOR INVOICE
+  INV_SEASON: 'S5',    // Season 5
+  INV_YEAR: '2026',    // Tahun 2026
+};
+
+// === 1. TRIGGER KHUSUS GOOGLE FORM (DENGAN LOCK & ANTRIAN) ===
+function handleFormSubmitWa(e) {
+  if (!e || !e.range) return;
+
+  // 1. Mengaktifkan Lock (Kunci Antrian)
+  // Ini mencegah script berjalan tabrakan jika ada 3 orang submit bareng.
+  const lock = LockService.getScriptLock();
+  
+  try {
+    // Tunggu maksimal 30 detik untuk mendapatkan giliran antrian.
+    // Jika Siswa A sedang diproses, Siswa B akan menunggu di sini.
+    lock.waitLock(30000); 
+  } catch (e) {
+    console.log('Server sibuk/timeout, tidak bisa mendapatkan lock');
+    // Jika antrian terlalu penuh > 30 detik, hentikan (atau bisa kirim notif error admin)
+    return;
+  }
+
+  try {
+    const sheet = e.range.getSheet();
+    const row = e.range.getRow();
+
+    // 2. Delay Awal (Opsional, untuk memastikan data Form tersimpan sempurna di Sheet)
+    Utilities.sleep(2000); 
+
+    // 3. Proses Data Utama
+    processRow(sheet, row);
+
+    // 4. JEDA WAJIB (Throttle Fonnte)
+    // Setelah selesai kirim 1 WA, istirahat 5 detik sebelum melepaskan kunci.
+    // Ini agar WA tidak terkirim 'brutal' beruntun yang dianggap spam oleh WhatsApp.
+    Utilities.sleep(5000); 
+
+  } catch (error) {
+    console.error("Error di HandleForm: " + error.toString());
+  } finally {
+    // 5. Lepaskan Kunci
+    // Agar script untuk Siswa berikutnya bisa mulai jalan.
+    lock.releaseLock();
+  }
+}
+
+// === 2. TRIGGER MANUAL ===
+function manualGenerate() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const row = sheet.getActiveRange().getRow();
+  if (row < 2) {
+    SpreadsheetApp.getUi().alert('Pilih baris data peserta!');
+    return;
+  }
+  processRow(sheet, row);
+}
+
+// === 3. FUNGSI UTAMA (UPDATE: KIRIM NAMA FILE DINAMIS) ===
+function processRow(sheet, row) {
+  const data = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  
+  // Cek Status Invoice
+  const existingLink = (data[CONFIG.COL_LINK_PDF] || "").toString();
+  if (existingLink.includes("http")) {
+    console.log("Invoice sudah ada. Skip.");
+    return;
+  }
+
+  // Cek Nomor WA
+  const rawWA = sheet.getRange(row, CONFIG.COL_WA + 1).getDisplayValue();
+  if (!rawWA || rawWA.toString() === '') {
+    console.log("Nomor WA kosong.");
+    return;
+  }
+
+  // Siapkan Data
+  const invoiceData = {
+    timestamp: data[0],
+    namaLengkap: data[CONFIG.COL_NAMA], 
+    nomorWA: rawWA, 
+    kotaProvinsiIndonesia: data[CONFIG.COL_KOTA],
+    pilihanKelas: data[CONFIG.COL_KELAS], 
+    pilihanPembayaran: data[CONFIG.COL_PEMBAYARAN],
+    syaratDiskon: data[CONFIG.COL_DISKON]
+  };
+
+  const invoiceNumber = generateInvoiceNumber(row, invoiceData.pilihanKelas);
+  const pricing = calculatePricing(invoiceData.pilihanPembayaran, invoiceData.syaratDiskon, invoiceData.pilihanKelas);
+  let logoBase64 = getLogoBase64();
+
+  // Generate PDF
+  const htmlContent = createInvoiceHTML(invoiceData, invoiceNumber, pricing, logoBase64);
+  
+  // === NAMA FILE DINAMIS ===
+  // Contoh: Invoice_N3S5-2026-008_Dimas Achmad.pdf
+  const pdfName = `Invoice_${invoiceNumber.replace(/\//g, '-')}_${invoiceData.namaLengkap}`;
+  
+  try {
+    const pdfBlob = Utilities.newBlob(htmlContent, 'text/html', 'temp.html').getAs('application/pdf').setName(pdfName + '.pdf');
+    const folder = DriveApp.getFolderById(CONFIG.FOLDER_ID);
+    const file = folder.createFile(pdfBlob);
+    
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    const pdfUrl = file.getUrl();
+    const fileId = file.getId(); 
+
+    // Simpan Link di Spreadsheet
+    sheet.getRange(row, CONFIG.COL_LINK_PDF + 1).setValue(pdfUrl);
+
+    // === PERBAIKAN: KIRIM VARIABEL pdfName KE FUNGSI WA ===
+    const hasilWA = sendWhatsApp(invoiceData.namaLengkap, rawWA, pdfUrl, fileId, pdfName);
+
+    // Update Status WA
+    let statusText = "";
+    if (hasilWA.sukses === true) {
+      statusText = "TERKIRIM";
+    } else {
+      statusText = "GAGAL: " + hasilWA.alasan;
+    }
+    sheet.getRange(row, CONFIG.COL_STATUS_WA + 1).setValue(statusText);
+    SpreadsheetApp.flush();
+    
+  } catch (e) {
+    console.error("Gagal Script: " + e.toString());
+    sheet.getRange(row, CONFIG.COL_STATUS_WA + 1).setValue("ERROR SCRIPT: " + e.message);
+  }
+}
+
+// === FUNGSI KIRIM WA (UPDATE: TERIMA NAMA FILE) ===
+function sendWhatsApp(nama, nomorHP, linkPDF, fileId, pdfName) {
+  if (!CONFIG.WA_TOKEN || CONFIG.WA_TOKEN.includes('MASUKKAN')) {
+    return { sukses: false, alasan: "Token Belum Diisi" };
+  }
+
+  // Normalisasi Nomor
+  let rawInput = (nomorHP || "").toString().trim();
+  let cleanNum = rawInput.replace(/\D/g, ''); 
+  let finalPhone = "";
+
+  if (cleanNum.startsWith('81')) finalPhone = cleanNum;
+  else if (cleanNum.startsWith('62')) finalPhone = cleanNum;
+  else if (cleanNum.startsWith('080') || cleanNum.startsWith('090') || cleanNum.startsWith('070')) finalPhone = '81' + cleanNum.substring(1);
+  else if (cleanNum.startsWith('08')) finalPhone = '62' + cleanNum.substring(1);
+  else finalPhone = '62' + cleanNum;
+
+  if (finalPhone.length < 7) return { sukses: false, alasan: "Nomor HP Invalid" };
+
+  const directLink = "https://drive.google.com/uc?export=download&id=" + fileId;
+
+  const message = `Halo kak~*${nama}*,
+
+Terima kasih telah mendaftar Bimbel Kelas N3 Season 5 Japan Arena!
+
+Silakan melakukan pembayaran ke nomor rekening di bawah ini, sesuai dengan jumlah yang tertera pada link invoice yang kami lampirkan.
+
+${linkPDF}
+
+*${CONFIG.BANK_NAME}*
+*${CONFIG.ACCOUNT_NUMBER}*
+a.n ${CONFIG.ACCOUNT_NAME}
+
+Batas pembayaran adalah 7 hari setelah pendaftaran.
+
+Setelah pembayaran terkonfirmasi, kami akan memasukkan kakak ke dalam grup kelas.
+
+何卒よろしくお願いいたします。
+
+Salam,
+Admin Japan Arena`;
+
+  const options = {
+    "method" : "post",
+    "payload" : {
+      "target": finalPhone,
+      "message": message,
+      "url": directLink,
+      
+      // === UPDATE: GUNAKAN NAMA FILE DINAMIS + .pdf ===
+      "filename": pdfName + ".pdf", 
+      
+      "countryCode": "0" 
+    },
+    "headers": { "Authorization": CONFIG.WA_TOKEN },
+    "muteHttpExceptions": true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch("https://api.fonnte.com/send", options);
+    const result = JSON.parse(response.getContentText());
+    
+    if (result.status === true) return { sukses: true, alasan: "OK" };
+    else return { sukses: false, alasan: result.reason || "Fonnte Error" };
+  } catch (e) {
+    return { sukses: false, alasan: "Koneksi Error" };
+  }
+}
+
+// === LOGIKA HARGA ===
+function calculatePricing(pilihanPembayaran, syaratDiskon, rawKelas) {
+  let subTotal = 0;
+  let potongan = 0;
+  let namaKelas = rawKelas || 'Kelas Bahasa Jepang';
+  const kelasStr = (rawKelas || "").toString().toUpperCase();
+
+  if (kelasStr.includes('N2')) namaKelas = 'Kelas N2';
+  else if (kelasStr.includes('N3')) namaKelas = 'Kelas N3';
+  else if (kelasStr.includes('N4')) namaKelas = 'Kelas N4';
+  else if (kelasStr.includes('N5')) namaKelas = 'Kelas N5';
+
+  const bayarStr = (pilihanPembayaran || "").toString().toLowerCase();
+  const isFull = bayarStr.includes('full'); 
+
+  const syaratStr = (syaratDiskon || "").toString().toLowerCase();
+  const syaratOK = syaratStr.includes("full") || syaratStr.includes("lunas") || syaratStr.includes("pembayaran");
+
+  if (kelasStr.includes('N2')) {
+    subTotal = 2500000;
+    if (isFull && syaratOK) potongan = 500000; 
+  } 
+  else if (kelasStr.includes('N3')) {
+    subTotal = 1800000;
+    if (isFull && syaratOK) potongan = 300000;
+  } 
+  else {
+    const matchHarga = bayarStr.match(/(?:Rp\.?\s*)(\d+(?:[.,]\d+)?)\s*(?:jt|juta)?/i);
+    if (matchHarga) {
+      let angka = parseFloat(matchHarga[1].replace(',', '.'));
+      subTotal = (bayarStr.includes('jt') || bayarStr.includes('juta')) ? angka * 1000000 : angka;
+    } else {
+      subTotal = 1500000; 
+    }
+  }
+
+  return { subTotal: subTotal, potongan: potongan, total: subTotal - potongan, items: [{ description: namaKelas, qty: '1 Paket', price: subTotal }] };
+}
+
+// === HELPER & HTML ===
+function getLogoBase64() {
+  try {
+    if (CONFIG.LOGO_ID) {
+      const file = DriveApp.getFileById(CONFIG.LOGO_ID);
+      return `data:${file.getMimeType()};base64,${Utilities.base64Encode(file.getBlob().getBytes())}`;
+    }
+  } catch (e) {} return "";
+}
+
+function generateInvoiceNumber(row, rawKelas) {
+  let code = "GEN"; 
+  const textKelas = (rawKelas || "").toString().toUpperCase();
+  if (textKelas.includes("N2")) code = "N2";
+  else if (textKelas.includes("N3")) code = "N3";
+  else if (textKelas.includes("N4")) code = "N4";
+  else if (textKelas.includes("N5")) code = "N5";
+
+  const season = CONFIG.INV_SEASON || "S5";
+  const year = CONFIG.INV_YEAR || "2026";
+  const sequence = row - 1;
+  const padSequence = String(sequence).padStart(3, '0');
+
+  return `${code}${season}/${year}/${padSequence}`;
+}
+
+// === HTML GENERATOR (PREMIUM DESIGN & BIG LOGO) ===
+function createInvoiceHTML(data, invoiceNumber, pricing, logoBase64) {
+  const tanggalInvoice = Utilities.formatDate(new Date(data.timestamp), 'Asia/Jakarta', 'dd MMMM yyyy');
+  const batasRaw = new Date(data.timestamp); batasRaw.setDate(batasRaw.getDate() + 7);
+  const batasPembayaran = Utilities.formatDate(batasRaw, 'Asia/Jakarta', 'dd MMMM yyyy');
+  const fmt = (n) => 'Rp ' + n.toLocaleString('id-ID');
+  const item = pricing.items[0];
+
+  // SETTING LOGO BESAR DISINI
+  // max-height: 160px (Sangat Besar & Jelas)
+  const imgTag = logoBase64 && logoBase64.length > 100
+    ? `<img src="${logoBase64}" style="max-height: 160px; width: auto; max-width: 350px; display: block;" alt="Logo Japan Arena">` 
+    : `<div style="padding:20px; background:#f0f0f0; color:#555; font-weight:bold; font-size:20px;">[LOGO JAPAN ARENA]</div>`;
+
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+  <style>
+    @page { size: A4; margin: 0; }
+    body { 
+      margin: 0; padding: 0; 
+      width: 210mm; height: 297mm; 
+      font-family: 'Roboto', sans-serif; 
+      color: #2c3e50; 
+      background: #ffffff;
+      -webkit-print-color-adjust: exact;
+    }
+    
+    .container { 
+      padding: 50px; 
+      position: relative; 
+      height: 100%; 
+      box-sizing: border-box; 
+    }
+
+    /* HEADER SECTION */
+    .header { 
+      display: flex; 
+      justify-content: space-between; 
+      align-items: flex-start; 
+      margin-bottom: 50px; 
+      border-bottom: 4px solid #fca311; /* Garis Emas Tebal */
+      padding-bottom: 25px;
+    }
+    
+    .logo-wrapper {
+      /* Pastikan logo punya ruang cukup */
+      flex: 1;
+    }
+
+    .invoice-title-block {
+      text-align: right;
+      flex: 1;
+    }
+    
+    h1 { 
+      margin: 0; 
+      font-size: 48px; 
+      color: #20407d; /* Biru Dongker */
+      font-weight: 900; 
+      letter-spacing: 2px;
+      line-height: 1;
+    }
+    
+    .invoice-sub {
+      font-size: 14px;
+      color: #7f8c8d;
+      margin-top: 5px;
+      letter-spacing: 1px;
+    }
+
+    .status-badge {
+      display: inline-block;
+      background-color: #e8f5e9;
+      color: #27ae60;
+      padding: 8px 15px;
+      border-radius: 50px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      margin-top: 10px;
+      border: 1px solid #27ae60;
+    }
+
+    /* INFO GRID */
+    .info-grid {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 40px;
+    }
+    
+    .bill-to-title {
+      font-size: 11px;
+      color: #95a5a6;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    
+    .student-name {
+      font-size: 22px;
+      font-weight: 700;
+      color: #20407d;
+      margin-bottom: 5px;
+    }
+    
+    .student-detail {
+      font-size: 14px;
+      line-height: 1.6;
+      color: #34495e;
+    }
+
+    .meta-data table {
+      width: auto;
+      border-collapse: collapse;
+    }
+    .meta-data td {
+      padding: 4px 0 4px 20px;
+      font-size: 14px;
+    }
+    .meta-label {
+      color: #7f8c8d;
+      font-weight: 500;
+      text-align: right;
+    }
+    .meta-val {
+      color: #2c3e50;
+      font-weight: 700;
+      text-align: right;
+    }
+
+    /* TABLE STYLE */
+    .table-wrapper {
+      margin-bottom: 30px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #ecf0f1;
+    }
+    
+    table.main-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    
+    .main-table th {
+      background-color: #20407d;
+      color: white;
+      padding: 15px 20px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      text-align: left;
+    }
+    
+    .main-table td {
+      padding: 18px 20px;
+      border-bottom: 1px solid #ecf0f1;
+      font-size: 14px;
+      color: #34495e;
+    }
+    
+    .main-table tr:nth-child(even) {
+      background-color: #f8f9fa;
+    }
+
+    /* TOTAL CALCULATION */
+    .total-area {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 50px;
+    }
+    
+    .total-table {
+      width: 350px;
+    }
+    
+    .total-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 0;
+      font-size: 14px;
+    }
+    
+    .total-label { color: #7f8c8d; }
+    .total-value { font-weight: 700; color: #2c3e50; }
+    
+    .discount-row {
+      color: #c0392b;
+    }
+    
+    .grand-total {
+      margin-top: 15px;
+      padding-top: 15px;
+      border-top: 2px solid #20407d;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    .grand-label {
+      font-size: 16px;
+      font-weight: 700;
+      color: #20407d;
+    }
+    
+    .grand-value {
+      font-size: 24px;
+      font-weight: 900;
+      color: #20407d;
+    }
+
+    /* PAYMENT BOX */
+    .payment-container {
+      background-color: #fcfcfc;
+      border-left: 6px solid #fca311;
+      padding: 20px 30px;
+      border-radius: 0 4px 4px 0;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.03);
+    }
+    
+    .pay-title {
+      font-size: 12px;
+      font-weight: 800;
+      color: #20407d;
+      text-transform: uppercase;
+      margin-bottom: 5px;
+    }
+    
+    .pay-desc {
+      font-size: 12px;
+      color: #7f8c8d;
+      margin-bottom: 15px;
+    }
+    
+    .bank-info {
+      display: flex;
+      gap: 50px;
+    }
+    
+    .bank-detail-group small {
+      display: block;
+      font-size: 11px;
+      color: #95a5a6;
+      text-transform: uppercase;
+    }
+    
+    .bank-detail-group span {
+      display: block;
+      font-size: 15px;
+      font-weight: 700;
+      color: #2c3e50;
+      margin-top: 2px;
+    }
+
+    /* FOOTER / SIGNATURE */
+    .footer {
+      position: absolute;
+      bottom: 50px;
+      width: calc(100% - 100px);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+    }
+    
+    .thank-you {
+      font-size: 24px;
+      font-family: serif;
+      font-style: italic;
+      color: #bdc3c7;
+      font-weight: bold;
+    }
+    
+    .signature {
+      text-align: center;
+    }
+    
+    .sign-space {
+      height: 60px;
+      margin-bottom: 10px;
+      border-bottom: 1px solid #bdc3c7;
+      width: 200px;
+    }
+    
+    .manager-name {
+      font-weight: 700;
+      color: #2c3e50;
+      font-size: 14px;
+    }
+    
+    .manager-title {
+      font-size: 11px;
+      color: #7f8c8d;
+    }
+
+  </style>
+</head>
+<body>
+  <div class="container">
+    
+    <div class="header">
+      <div class="logo-wrapper">
+        ${imgTag}
+      </div>
+      <div class="invoice-title-block">
+        <h1>INVOICE</h1>
+        <div class="invoice-sub">#${invoiceNumber}</div>
+        <div class="status-badge">LUNAS / PAID</div>
+      </div>
+    </div>
+
+    <div class="info-grid">
+      <div class="student-info">
+        <div class="bill-to-title">DITAGIHKAN KEPADA (Bill To):</div>
+        <div class="student-name">${data.namaLengkap}</div>
+        <div class="student-detail">
+          ${data.kotaProvinsiIndonesia ? data.kotaProvinsiIndonesia : 'Indonesia'}<br>
+          ${data.nomorWA}
+        </div>
+      </div>
+      
+      <div class="meta-data">
+        <table>
+          <tr>
+            <td class="meta-label">Tanggal Invoice:</td>
+            <td class="meta-val">${tanggalInvoice}</td>
+          </tr>
+          <tr>
+            <td class="meta-label">Batas Pembayaran:</td>
+            <td class="meta-val" style="color:#c0392b;">${batasPembayaran}</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="table-wrapper">
+      <table class="main-table">
+        <thead>
+          <tr>
+            <th width="5%" style="text-align:center">No</th>
+            <th width="50%">Deskripsi (Description)</th>
+            <th width="20%" style="text-align:center">Qty</th>
+            <th width="25%" style="text-align:right">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="text-align:center">1</td>
+            <td>
+              <strong>${item.description}</strong><br>
+              <span style="font-size:12px; color:#7f8c8d;">Untuk Persiapan JLPT Juli 2026</span>
+            </td>
+            <td style="text-align:center">${item.qty}</td>
+            <td style="text-align:right">${fmt(item.price)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="total-area">
+      <div class="total-table">
+        <div class="total-row">
+          <span class="total-label">Sub Total</span>
+          <span class="total-value">${fmt(pricing.subTotal)}</span>
+        </div>
+        <div class="total-row discount-row">
+          <span class="total-label">Diskon (Promo)</span>
+          <span class="total-value">- ${fmt(pricing.potongan)}</span>
+        </div>
+        <div class="grand-total">
+          <span class="grand-label">TOTAL BAYAR</span>
+          <span class="grand-value">${fmt(pricing.total)}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="payment-container">
+      <div class="pay-title">Metode Pembayaran (Payment Method)</div>
+      <div class="pay-desc">Pembayaran diterima melalui transfer bank resmi Japan Arena:</div>
+      
+      <div class="bank-info">
+        <div class="bank-detail-group">
+          <small>Nama Bank</small>
+          <span>${CONFIG.BANK_NAME}</span>
+        </div>
+        <div class="bank-detail-group">
+          <small>No. Rekening</small>
+          <span style="font-family:monospace; letter-spacing:1px; font-size:16px;">${CONFIG.ACCOUNT_NUMBER}</span>
+        </div>
+        <div class="bank-detail-group">
+          <small>Atas Nama</small>
+          <span>${CONFIG.ACCOUNT_NAME}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div class="thank-you">Arigatou Gozaimasu!</div>
+      <div class="signature">
+        <div class="sign-space">
+           </div>
+        <div class="manager-name">${CONFIG.ACCOUNT_NAME}</div>
+        <div class="manager-title">Manager, Japan Arena</div>
+      </div>
+    </div>
+
+  </div>
+</body>
+</html>
+  `;
+}
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('📄 Invoice Generator WA').addItem('Generate Manual (Baris Aktif)', 'manualGenerate').addToUi();
+}
